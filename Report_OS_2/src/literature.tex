@@ -1,0 +1,361 @@
+\section{Исходная программа}
+
+\begin{lstlisting}[language=C]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+#include <windows.h>
+#include "gauss.h"
+
+double now_seconds(){
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+
+static void usage(const char *p){
+    printf("Usage: %s [-n size] [-t max_threads] [-r seed] [-f filename]\n", p);
+    printf("Example: %s -n 500 -t 8 -r 123\n", p);
+    printf("(Project: Laba2_OS — Parallel Gaussian Elimination)\n");
+}
+
+int main(int argc, char **argv){
+    int n = 200;
+    int max_threads = 4;
+    int seed = -1;
+    const char *fname = NULL;
+
+    for(int i=1;i<argc;i++){
+        if(strcmp(argv[i],"-n")==0 && i+1<argc) n = atoi(argv[++i]);
+        else if(strcmp(argv[i],"-t")==0 && i+1<argc) max_threads = atoi(argv[++i]);
+        else if(strcmp(argv[i],"-r")==0 && i+1<argc) seed = atoi(argv[++i]);
+        else if(strcmp(argv[i],"-f")==0 && i+1<argc) fname = argv[++i];
+        else { usage(argv[0]); return 1; }
+    }
+
+    double *A = (double*)malloc(sizeof(double)*n*n);
+    double *b = (double*)malloc(sizeof(double)*n);
+    double *x = (double*)calloc(n, sizeof(double));
+    if(!A || !b || !x){ fprintf(stderr,"alloc fail\n"); return 2; }
+
+    if(fname){
+        FILE *f = fopen(fname,"r");
+        if(!f){ perror("fopen"); return 3; }
+        int rn;
+        if(fscanf(f,"%d",&rn)!=1){ fprintf(stderr,"bad file\n"); return 4; }
+        if(rn != n){ fprintf(stderr,"file n != specified n; using file n\n"); n = rn; }
+        for(int i=0;i<n*n;i++) fscanf(f,"%lf",&A[i]);
+        for(int i=0;i<n;i++) fscanf(f,"%lf",&b[i]);
+        fclose(f);
+    } else {
+        if(seed>=0) srand(seed); else srand((unsigned)time(NULL));
+        for(int i=0;i<n;i++){
+            for(int j=0;j<n;j++){
+                double v = ((double)rand()/RAND_MAX)*2.0 - 1.0;
+                A[i*n + j] = v;
+            }
+        }
+        for(int i=0;i<n;i++){
+            double s = 0;
+            for(int j=0;j<n;j++) s += fabs(A[i*n + j]);
+            A[i*n + i] += s + 1.0;
+            b[i] = ((double)rand()/RAND_MAX)*10.0;
+        }
+    }
+
+    printf("Matrix size: %d x %d, max_threads=%d\n", n, n, max_threads);
+    printf("Program will print active thread counts during elimination.\n");
+
+    double t0 = now_seconds();
+    int rc = gauss_solve(A,b,x,n,max_threads,1);
+    double t1 = now_seconds();
+
+    if(rc!=0){
+        fprintf(stderr,"gauss failed (maybe singular)\n");
+        return 5;
+    }
+
+    printf("Solved in %.6f seconds\n", t1-t0);
+    int toprint = (n<10)?n:10;
+    printf("x[0..%d]= ", toprint-1);
+    for(int i=0;i<toprint;i++) printf("%.6g ", x[i]);
+    printf("\n");
+
+    free(A); free(b); free(x);
+    return 0;
+}
+\end{lstlisting}
+Листинг 1: \texttt{main.c} - Основная программа, обрабатывающая аргументы командной строки и управляющая решением СЛАУ
+
+\begin{lstlisting}[language=C]
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <windows.h>
+#include "gauss.h"
+#include "threads_lim.h"
+
+typedef struct {
+    double *A, *b;
+    int n, k, i;
+} RowTask;
+
+static DWORD WINAPI row_eliminate(void *arg) {
+    RowTask *t = (RowTask*)arg;
+    int n = t->n, k = t->k, i = t->i;
+    double *A = t->A, *b = t->b;
+
+    double factor = A[i*n + k] / A[k*n + k];
+    for (int j = k; j < n; j++)
+        A[i*n + j] -= factor * A[k*n + j];
+    b[i] -= factor * b[k];
+
+    free(t);
+    threads_lim_release();
+    return 0;
+}
+
+int gauss_solve(double *A, double *b, double *x, int n, int max_threads, int verbose) {
+    threads_lim_init(max_threads);
+
+    for (int k = 0; k < n-1; k++) {
+        int pivot = k;
+        double maxv = fabs(A[k*n + k]);
+        for (int i = k+1; i < n; i++) {
+            if (fabs(A[i*n + k]) > maxv) {
+                maxv = fabs(A[i*n + k]);
+                pivot = i;
+            }
+        }
+        if (pivot != k) {
+            for (int j = 0; j < n; j++) {
+                double tmp = A[k*n + j];
+                A[k*n + j] = A[pivot*n + j];
+                A[pivot*n + j] = tmp;
+            }
+            double tmpb = b[k]; b[k] = b[pivot]; b[pivot] = tmpb;
+        }
+
+        if (fabs(A[k*n + k]) < 1e-12) {
+            threads_lim_destroy();
+            return 1;
+        }
+
+        int rows = n - (k+1);
+        HANDLE *th = malloc(sizeof(HANDLE) * rows);
+        if (!th) {
+            threads_lim_destroy();
+            return 1;
+        }
+
+        for (int i = k+1; i < n; i++) {
+            threads_lim_acquire();
+            RowTask *task = malloc(sizeof(RowTask));
+            if (!task) {
+                threads_lim_release();
+                free(th);
+                threads_lim_destroy();
+                return 1;
+            }
+            task->A = A; task->b = b;
+            task->n = n; task->k = k; task->i = i;
+            
+            th[i - (k+1)] = CreateThread(NULL, 0, row_eliminate, task, 0, NULL);
+            if (!th[i - (k+1)]) {
+                free(task);
+                threads_lim_release();
+                for (int j = k+1; j < i; j++) {
+                    WaitForSingleObject(th[j - (k+1)], INFINITE);
+                    CloseHandle(th[j - (k+1)]);
+                }
+                free(th);
+                threads_lim_destroy();
+                return 1;
+            }
+        }
+
+        WaitForMultipleObjects(rows, th, TRUE, INFINITE);
+        
+        for (int i = 0; i < rows; i++) {
+            CloseHandle(th[i]);
+        }
+        free(th);
+
+        if (verbose && (k % 10 == 0 || k == n-2))
+            printf("[step %d/%d] active threads limited to %d\n", k, n, max_threads);
+    }
+
+    for (int i = n-1; i >= 0; i--) {
+        double sum = b[i];
+        for (int j = i+1; j < n; j++)
+            sum -= A[i*n + j] * x[j];
+        x[i] = sum / A[i*n + i];
+    }
+
+    threads_lim_destroy();
+    return 0;
+}
+\end{lstlisting}
+Листинг 2: \texttt{gauss.c} - Реализация метода Гаусса с многопоточной обработкой строк
+
+\begin{lstlisting}[language=C]
+#include "threads_lim.h"
+#include <windows.h>
+
+static HANDLE sem_handle = NULL;
+
+void threads_lim_init(int max_concurrent){
+    sem_handle = CreateSemaphore(NULL, max_concurrent, max_concurrent, NULL);
+}
+
+void threads_lim_acquire(void){
+    WaitForSingleObject(sem_handle, INFINITE);
+}
+
+void threads_lim_release(void){
+    ReleaseSemaphore(sem_handle, 1, NULL);
+}
+
+void threads_lim_destroy(void){
+    if(sem_handle) {
+        CloseHandle(sem_handle);
+        sem_handle = NULL;
+    }
+}
+\end{lstlisting}
+Листинг 3: \texttt{threads\textunderscore lim.c} - Реализация ограничения количества потоков с помощью семафора Windows
+
+\begin{lstlisting}[language=C]
+#ifndef GAUSS_H
+#define GAUSS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int gauss_solve(double *A, double *b, double *x, int n, int max_threads, int verbose);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+\end{lstlisting}
+Листинг 4: \texttt{gauss.h} - Заголовочный файл для функции решения СЛАУ методом Гаусса
+
+\begin{lstlisting}[language=C]
+#ifndef THREADS_LIM_H
+#define THREADS_LIM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void threads_lim_init(int max_concurrent);
+void threads_lim_acquire(void);
+void threads_lim_release(void);
+void threads_lim_destroy(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+\end{lstlisting}
+Листинг 5: \texttt{threads\textunderscore lim.h} - Заголовочный файл для управления ограничением потоков
+
+\section{Системные вызовы Windows}
+
+\begin{verbatim}
+<?xml version="1.0" encoding="UTF-8"?>
+<procmon><processlist><process>
+<ProcessIndex>470</ProcessIndex>
+<ProcessId>76880</ProcessId>
+<ParentProcessId>14916</ParentProcessId>
+<ParentProcessIndex>471</ParentProcessIndex>
+<AuthenticationId>00000000:049676a0</AuthenticationId>
+<CreateTime>134057275798954287</CreateTime>
+<FinishTime>0</FinishTime>
+<IsVirtualized>0</IsVirtualized>
+<Is64bit>1</Is64bit>
+<Integrity>Обязательная метка\Высокий обязательный уровень</Integrity>
+<Owner>DARIA-BOOK\Daria</Owner>
+<ProcessName>Procmon64.exe</ProcessName>
+<ImagePath>C:\Users\Daria\Downloads\ProcessMonitor\Procmon64.exe</ImagePath>
+<CommandLine>&quot;C:\Users\Daria\Downloads\ProcessMonitor\Procmon64.exe&quot; </CommandLine>
+<CompanyName>Sysinternals - www.sysinternals.com</CompanyName>
+<Version>4.01</Version>
+<Description>Process Monitor</Description>
+<modulelist>
+<module>
+<Timestamp>134057285970173388</Timestamp>
+<BaseAddress>0x5ff60000</BaseAddress>
+<Size>155648</Size>
+<Path>C:\Program Files\Bonjour\mdnsNSP.dll</Path>
+<Version>3,1,0,1</Version>
+<Company>Apple Inc.</Company>
+<Description>Bonjour Namespace Provider</Description>
+</module>
+<module>
+<Timestamp>134057285970173388</Timestamp>
+<BaseAddress>0x7ff677f80000</BaseAddress>
+<Size>2232320</Size>
+<Path>C:\Users\Daria\Downloads\ProcessMonitor\Procmon64.exe</Path>
+<Version>4.01</Version>
+<Company>Sysinternals - www.sysinternals.com</Company>
+<Description>Process Monitor</Description>
+</module>
+... (и так далее, весь XML файл полностью)
+</modulelist>
+</process>
+<process>
+<ProcessIndex>471</ProcessIndex>
+<ProcessId>14916</ProcessId>
+<ParentProcessId>66264</ParentProcessId>
+<ParentProcessIndex>597</ParentProcessIndex>
+<AuthenticationId>00000000:049676be</AuthenticationId>
+<CreateTime>134056832338204969</CreateTime>
+<FinishTime>0</FinishTime>
+<IsVirtualized>0</IsVirtualized>
+<Is64bit>1</Is64bit>
+<Integrity>Обязательная метка\Средний обязательный уровень</Integrity>
+<Owner>DARIA-BOOK\Daria</Owner>
+<ProcessName>Explorer.EXE</ProcessName>
+<ImagePath>C:\Windows\Explorer.EXE</ImagePath>
+<CommandLine>C:\Windows\Explorer.EXE</CommandLine>
+<CompanyName>Microsoft Corporation</CompanyName>
+<Version>10.0.19041.4522 (WinBuild.160101.0800)</Version>
+<Description>Проводник</Description>
+<modulelist>
+... (все модули Explorer.EXE)
+</modulelist>
+</process>
+<process>
+<ProcessIndex>472</ProcessIndex>
+<ProcessId>4</ProcessId>
+<ParentProcessId>0</ParentProcessId>
+<ParentProcessIndex>473</ParentProcessIndex>
+<AuthenticationId>00000000:000003e7</AuthenticationId>
+<CreateTime>134052960184910276</CreateTime>
+<FinishTime>0</FinishTime>
+<IsVirtualized>0</IsVirtualized>
+<Is64bit>1</Is64bit>
+<Integrity>Обязательная метка\Обязательный уровень системы</Integrity>
+<Owner>NT AUTHORITY\СИСТЕМА</Owner>
+<ProcessName>System</ProcessName>
+<ImagePath>System</ImagePath>
+<CommandLine></CommandLine>
+<CompanyName></CompanyName>
+<Version></Version>
+<Description></Description>
+<modulelist>
+... (все модули System)
+</modulelist>
+</process>
+</processlist>
+</procmon>
+\end{verbatim}
